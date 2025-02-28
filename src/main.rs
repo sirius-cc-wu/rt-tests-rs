@@ -1,11 +1,12 @@
 use clap::{value_parser, Arg, ArgAction, Command};
 use nix::errno::Errno;
+use nix::sys::time::{TimeSpec, TimeValLike};
 use nix::time::{clock_nanosleep, ClockId, ClockNanosleepFlags};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use thread_priority::ScheduleParams;
 use thread_priority::{
     unix::{
@@ -16,10 +17,10 @@ use thread_priority::{
 };
 
 struct Statistics {
-    min_latency: i64,
-    max_latency: i64,
-    avg_latency: f64,
-    total_latency: i64,
+    min_jitter: i64,
+    max_jitter: i64,
+    avg_jitter: f64,
+    total_jitter: i64,
     cycles: u64,
 }
 
@@ -30,7 +31,7 @@ struct SharedData {
 }
 
 fn main() {
-    let matches = Command::new("simple_cyclictest")
+    let matches = Command::new("latency")
         .version("1.0")
         .author("Sirius Wu")
         .about("Simplified cyclictest in Rust")
@@ -97,10 +98,10 @@ fn main() {
 
     let shared_data = Arc::new(SharedData {
         stats: Mutex::new(Statistics {
-            min_latency: i64::MAX,
-            max_latency: i64::MIN,
-            avg_latency: 0.0,
-            total_latency: 0,
+            min_jitter: i64::MAX,
+            max_jitter: i64::MIN,
+            avg_jitter: 0.0,
+            total_jitter: 0,
             cycles: 0,
         }),
         running: AtomicBool::new(true),
@@ -148,35 +149,30 @@ fn run_thread(shared_data: Arc<SharedData>, interval_us: u64, priority: i32) {
         return;
     }
 
-    let mut next_wakeup = SystemTime::now();
-
+    let start = ClockId::CLOCK_MONOTONIC.now().unwrap();
+    let interval = TimeSpec::from_duration(Duration::from_micros(interval_us));
+    let mut next_wakeup = start + interval;
     while shared_data.running.load(Ordering::SeqCst) {
-        next_wakeup += Duration::from_micros(interval_us);
-        let duration_since_epoch = next_wakeup
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards");
-        let timespec = nix::sys::time::TimeSpec::from(duration_since_epoch);
-
-        let start = Instant::now();
         if let Err(e) = clock_nanosleep(
             ClockId::CLOCK_MONOTONIC,
             ClockNanosleepFlags::TIMER_ABSTIME,
-            &timespec,
+            &next_wakeup,
         ) {
             if e != Errno::EINTR {
                 eprintln!("clock_nanosleep failed: {}", e);
                 break;
             }
         }
-        let actual_wakeup = Instant::now();
-        let latency = actual_wakeup.duration_since(start).as_micros() as i64;
+        let actual_wakeup = ClockId::CLOCK_MONOTONIC.now().unwrap();
+        let jitter = actual_wakeup.num_nanoseconds() - next_wakeup.num_nanoseconds();
+        next_wakeup = next_wakeup + interval;
 
         let mut stats = shared_data.stats.lock().unwrap();
         stats.cycles += 1;
-        stats.total_latency += latency;
-        stats.min_latency = stats.min_latency.min(latency);
-        stats.max_latency = stats.max_latency.max(latency);
-        stats.avg_latency = stats.total_latency as f64 / stats.cycles as f64;
+        stats.total_jitter += jitter;
+        stats.min_jitter = stats.min_jitter.min(jitter);
+        stats.max_jitter = stats.max_jitter.max(jitter);
+        stats.avg_jitter = stats.total_jitter as f64 / stats.cycles as f64;
     }
 }
 
@@ -187,13 +183,13 @@ fn report_statistics(shared_data: Arc<SharedData>, rx: Receiver<()>) {
             Err(_) => {
                 let stats = shared_data.stats.lock().unwrap();
                 if shared_data.nanoseconds {
-                    println!("Min latency: {} ns", stats.min_latency * 1000);
-                    println!("Max latency: {} ns", stats.max_latency * 1000);
-                    println!("Avg latency: {:.2} ns", stats.avg_latency * 1000.0);
+                    println!("Min jitter: {} ns", stats.min_jitter);
+                    println!("Max jitter: {} ns", stats.max_jitter);
+                    println!("Avg jitter: {:.2} ns", stats.avg_jitter);
                 } else {
-                    println!("Min latency: {} us", stats.min_latency);
-                    println!("Max latency: {} us", stats.max_latency);
-                    println!("Avg latency: {:.2} us", stats.avg_latency);
+                    println!("Min jitter: {} us", stats.min_jitter / 1000);
+                    println!("Max jitter: {} us", stats.max_jitter / 1000);
+                    println!("Avg jitter: {:.2} us", stats.avg_jitter / 1000.0);
                 }
                 println!("Cycles: {}", stats.cycles);
             }

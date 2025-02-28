@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 thread-priority = "1.2.0"
-nix = { version="0.29.0", features=["sched", "time", "mman"] }
+nix = { version="0.29.0", features=["time", "mman"] }
 clap = "4.5.31"
 ctrlc = "3.4.5"
 thread-id = "5.0.0"

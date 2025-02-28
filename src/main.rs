@@ -1,8 +1,6 @@
 use clap::{value_parser, Arg, ArgAction, Command};
 use nix::errno::Errno;
-use nix::sched::{sched_setaffinity, CpuSet};
 use nix::time::{clock_nanosleep, ClockId, ClockNanosleepFlags};
-use nix::unistd::Pid;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -62,18 +60,9 @@ fn main() {
                 .short('p')
                 .long("priority")
                 .value_name("PRIO")
-                .help("Priority of the threads (default: 50)")
+                .help("Priority of the threads (default: 1)")
                 .action(ArgAction::Set)
-                .default_value("50"),
-        )
-        .arg(
-            Arg::new("cpu")
-                .short('a')
-                .long("cpu")
-                .value_name("CPU")
-                .help("CPU affinity (optional)")
-                .action(ArgAction::Set)
-                .default_value(None),
+                .default_value("1"),
         )
         .arg(
             Arg::new("nanoseconds")
@@ -95,7 +84,6 @@ fn main() {
         .or(Some(&1000u64))
         .expect("interval");
     let priority = *matches.get_one("priority").or(Some(&50)).expect("priority");
-    let cpu_affinity: Option<usize> = matches.get_one::<usize>("cpu").copied();
     let nanoseconds = matches.contains_id("nanoseconds");
     let mlock = matches.contains_id("mlock");
 
@@ -124,37 +112,28 @@ fn main() {
     let (tx, rx): (Sender<()>, Receiver<()>) = channel();
 
     ctrlc::set_handler(move || {
+        println!("Ctrl-C received, stopping threads...");
         shared_data_clone.running.store(false, Ordering::SeqCst);
         let _ = tx.send(());
     })
     .expect("Error setting Ctrl-C handler");
 
-    let mut threads = Vec::new();
-
-    for _ in 0..num_threads {
+    for i in 0..num_threads {
         let shared_data_thread = shared_data.clone();
-        let handle = thread::spawn(move || {
-            run_thread(shared_data_thread, interval_us, priority, cpu_affinity);
+        println!(
+            "Starting thread {} with interval {}us and priority {}",
+            i, interval_us, priority
+        );
+        let _handle = thread::spawn(move || {
+            run_thread(shared_data_thread, interval_us, priority);
         });
-        threads.push(handle);
     }
 
     let shared_data_report = shared_data.clone();
-    thread::spawn(move || {
-        report_statistics(shared_data_report, rx);
-    });
-
-    for handle in threads {
-        handle.join().unwrap();
-    }
+    report_statistics(shared_data_report, rx);
 }
 
-fn run_thread(
-    shared_data: Arc<SharedData>,
-    interval_us: u64,
-    priority: i32,
-    cpu_affinity: Option<usize>,
-) {
+fn run_thread(shared_data: Arc<SharedData>, interval_us: u64, priority: i32) {
     let thread_id = thread_native_id();
     let params = ScheduleParams {
         sched_priority: priority,
@@ -167,16 +146,6 @@ fn run_thread(
     ) {
         eprintln!("Failed to set scheduler: {}", e);
         return;
-    }
-
-    if let Some(cpu) = cpu_affinity {
-        let mut cpu_set = CpuSet::new();
-        let pid = Pid::this();
-        cpu_set.set(cpu).unwrap();
-        if let Err(e) = sched_setaffinity(pid, &cpu_set) {
-            eprintln!("Failed to set affinity: {}", e);
-            return;
-        }
     }
 
     let mut next_wakeup = SystemTime::now();
